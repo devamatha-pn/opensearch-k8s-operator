@@ -193,18 +193,12 @@ func (r *ClusterReconciler) Reconcile() (ctrl.Result, error) {
 		return result.Result, result.Err
 	}
 
-	// Create bootstrap PVC for persistent storage
-	bootstrapPVC := builders.NewBootstrapPVC(r.instance)
-	result.CombineErr(ctrl.SetControllerReference(r.instance, bootstrapPVC, r.client.Scheme()))
-
 	bootstrapPod := builders.NewBootstrapPod(r.instance, r.reconcilerContext.Volumes, r.reconcilerContext.VolumeMounts)
 	result.CombineErr(ctrl.SetControllerReference(r.instance, bootstrapPod, r.client.Scheme()))
 	if r.instance.Status.Initialized {
 		// Exclude bootstrap from voting before deletion so small master pools do not lose quorum.
 		result.Combine(r.removeBootstrapPod(bootstrapPod))
-		result.Combine(r.client.ReconcileResource(bootstrapPVC, reconciler.StateAbsent))
 	} else {
-		result.Combine(r.client.ReconcileResource(bootstrapPVC, reconciler.StatePresent))
 		result.Combine(r.reconcileBootstrapPod(bootstrapPod))
 	}
 

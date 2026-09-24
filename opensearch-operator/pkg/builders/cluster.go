@@ -1186,14 +1186,13 @@ func NewBootstrapPod(
 		ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/false"}}},
 	}
 
-	// Use persistent storage for bootstrap pod to maintain cluster state across restarts
-	// This prevents cluster formation failures when the bootstrap pod restarts during initialization
+	// Bootstrap data only exists to form the initial cluster. It must not use an
+	// RWO PVC: a recreate can schedule the replacement on another node before EBS
+	// detaches, causing a permanent Multi-Attach bootstrap loop.
 	volumes = append(volumes, corev1.Volume{
 		Name: "data",
 		VolumeSource: corev1.VolumeSource{
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: fmt.Sprintf("%s-bootstrap-data", cr.Name),
-			},
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
 		},
 	})
 
@@ -1555,38 +1554,6 @@ func DiscoveryServiceName(cr *opensearchv1.OpenSearchCluster) string {
 
 func BootstrapPodName(cr *opensearchv1.OpenSearchCluster) string {
 	return fmt.Sprintf("%s-bootstrap-0", cr.Name)
-}
-
-func NewBootstrapPVC(cr *opensearchv1.OpenSearchCluster) *corev1.PersistentVolumeClaim {
-	labels := map[string]string{
-		helpers.ClusterLabel: cr.Name,
-	}
-
-	// Use default storage class and ReadWriteOnce access mode
-	// The bootstrap pod only needs a small amount of storage for cluster metadata
-	storageSize := resource.MustParse("1Gi")
-	if !cr.Spec.Bootstrap.DiskSize.IsZero() {
-		storageSize = cr.Spec.Bootstrap.DiskSize
-	}
-
-	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-bootstrap-data", cr.Name),
-			Namespace: cr.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteOnce,
-			},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: storageSize,
-				},
-			},
-			StorageClassName: cr.Spec.Bootstrap.StorageClassName,
-		},
-	}
 }
 
 func STSInNodePools(sts appsv1.StatefulSet, nodepools []opensearchv1.NodePool) bool {

@@ -889,23 +889,25 @@ var _ = Describe("Builders", func() {
 			Expect(actual[2]).To(Equal("./opensearch-docker-entrypoint.sh"))
 		})
 
-		It("should use PVC for data volume instead of emptyDir", func() {
+		It("should use emptyDir for bootstrap data and never create a PVC-backed volume", func() {
 			clusterObject := ClusterDescWithVersion("2.2.1")
 			result := NewBootstrapPod(&clusterObject, nil, nil)
 
-			// Find the data volume
 			var dataVolume *corev1.Volume
-			for i, volume := range result.Spec.Volumes {
-				if volume.Name == "data" {
+			for i := range result.Spec.Volumes {
+				if result.Spec.Volumes[i].Name == "data" {
 					dataVolume = &result.Spec.Volumes[i]
 					break
 				}
 			}
 
 			Expect(dataVolume).NotTo(BeNil())
-			Expect(dataVolume.VolumeSource.PersistentVolumeClaim).NotTo(BeNil())
-			Expect(dataVolume.VolumeSource.PersistentVolumeClaim.ClaimName).To(Equal(fmt.Sprintf("%s-bootstrap-data", clusterObject.Name)))
-			Expect(dataVolume.VolumeSource.EmptyDir).To(BeNil())
+			Expect(dataVolume.VolumeSource.EmptyDir).NotTo(BeNil())
+			Expect(dataVolume.VolumeSource.PersistentVolumeClaim).To(BeNil())
+			Expect(result.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name:      "data",
+				MountPath: clusterObject.Spec.General.GetOpenSearchHome() + "/data",
+			}))
 		})
 	})
 
@@ -1018,51 +1020,6 @@ var _ = Describe("Builders", func() {
 				Expect(result.Spec.Containers[0].VolumeMounts[1].Name).To(Equal(volumeMounts[1].Name))
 				Expect(result.Spec.Containers[0].VolumeMounts[2].Name).To(Equal(volumeMounts[2].Name))
 			})
-		})
-	})
-
-	When("Constructing a bootstrap PVC", func() {
-		It("should create a PVC with correct name and storage size", func() {
-			clusterObject := ClusterDescWithVersion("2.2.1")
-			result := NewBootstrapPVC(&clusterObject)
-
-			expectedName := fmt.Sprintf("%s-bootstrap-data", clusterObject.Name)
-			Expect(result.Name).To(Equal(expectedName))
-			Expect(result.Namespace).To(Equal(clusterObject.Namespace))
-			Expect(result.Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
-			Expect(result.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("1Gi")))
-		})
-
-		It("should use custom storage size from bootstrap resources", func() {
-			clusterObject := ClusterDescWithVersion("2.2.1")
-			clusterObject.Spec.Bootstrap.DiskSize = resource.MustParse("2Gi")
-			result := NewBootstrapPVC(&clusterObject)
-
-			Expect(result.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("2Gi")))
-		})
-
-		It("should have correct labels for cluster identification", func() {
-			clusterObject := ClusterDescWithVersion("2.2.1")
-			result := NewBootstrapPVC(&clusterObject)
-
-			Expect(result.Labels).To(HaveKeyWithValue(helpers.ClusterLabel, clusterObject.Name))
-		})
-
-		It("should use custom storage class when specified", func() {
-			clusterObject := ClusterDescWithVersion("2.2.1")
-			storageClass := "fast-ssd"
-			clusterObject.Spec.Bootstrap.StorageClassName = &storageClass
-			result := NewBootstrapPVC(&clusterObject)
-
-			Expect(result.Spec.StorageClassName).ToNot(BeNil())
-			Expect(*result.Spec.StorageClassName).To(Equal("fast-ssd"))
-		})
-
-		It("should not set storage class when not specified", func() {
-			clusterObject := ClusterDescWithVersion("2.2.1")
-			result := NewBootstrapPVC(&clusterObject)
-
-			Expect(result.Spec.StorageClassName).To(BeNil())
 		})
 	})
 
