@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/patch"
 	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
@@ -29,6 +30,12 @@ import (
 )
 
 const clusterReconcilerName = "cluster"
+
+// bootstrapElectionRequeueInterval is how often we re-check for an elected
+// cluster manager while the seed pod is being kept alive. An election completes
+// inside OpenSearch with no Kubernetes event to trigger a watch, so this must
+// poll rather than wait.
+const bootstrapElectionRequeueInterval = 15 * time.Second
 
 type ClusterReconciler struct {
 	client            k8s.K8sClient
@@ -117,7 +124,37 @@ func (r *ClusterReconciler) Reconcile() (ctrl.Result, error) {
 	bootstrapPod := builders.NewBootstrapPod(r.instance, r.reconcilerContext.Volumes, r.reconcilerContext.VolumeMounts)
 	result.CombineErr(ctrl.SetControllerReference(r.instance, bootstrapPod, r.client.Scheme()))
 	if r.instance.Status.Initialized {
-		result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
+		// Do NOT delete the seed on pod readiness alone.
+		//
+		// Status.Initialized is set from builders.AllMastersReady, which only
+		// checks StatefulSet pod readiness. The bootstrap pod also seeds the
+		// initial voting configuration under its own node id, so a cluster
+		// whose managers are all Ready may still be waiting to elect, because
+		// the only node it was told to expect is this very pod. Deleting it then
+		// strands the cluster permanently: it logs "an election requires a node
+		// with id [<bootstrap>]" / "which is not a quorum" and can never form, so
+		// Dashboards are never created and the deployment never reports healthy.
+		//
+		// Confirmed live on staging-eks: a 1-cluster-manager service sat in
+		// exactly this state indefinitely, while a 3-manager service on the same
+		// cluster formed cleanly (2 of 3 is a majority, so it can elect without
+		// the seed).
+		//
+		// Keeping the seed until a cluster manager has actually WON an election
+		// lets the single-manager case form too, because the manager can still
+		// reach the node it was configured to vote with.
+		if r.hasElectedClusterManager() {
+			result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
+		} else {
+			r.logger.Info(
+				"Keeping bootstrap pod until a cluster manager is elected",
+				"namespace", r.instance.Namespace, "cluster", r.instance.Name,
+			)
+			result.Combine(r.reconcileBootstrapPod(bootstrapPod))
+			// Re-check: an election can complete with no Kubernetes event to
+			// trigger us, so poll rather than wait for a watch notification.
+			result.Combine(&ctrl.Result{RequeueAfter: bootstrapElectionRequeueInterval}, nil)
+		}
 	} else {
 		result.Combine(r.reconcileBootstrapPod(bootstrapPod))
 	}
@@ -636,7 +673,42 @@ func (r *ClusterReconciler) UpdateClusterStatus() error {
 	})
 }
 
-// reconcileBootstrapPod handles bootstrap pod reconciliation with recreation for any changes
+// hasElectedClusterManager reports whether a cluster manager has actually WON
+// an election, as opposed to merely being Ready.
+//
+// Readiness is not sufficient and is what made this bug possible. The bootstrap
+// pod seeds the initial voting configuration under its own node id; a lone
+// cluster manager becomes Ready while still waiting to reach that seed, because
+// the node it was told to expect is the very pod we are deciding whether to
+// delete. Deleting on readiness therefore strands the cluster permanently.
+//
+// Any error is treated as "not elected" so the seed is kept. Failing closed here
+// costs a leftover pod; failing open strands a cluster that can never form.
+func (r *ClusterReconciler) hasElectedClusterManager() bool {
+	osClient, err := util.CreateClientForCluster(r.client, r.ctx, r.instance, nil)
+	if err != nil {
+		r.logger.V(1).Info("Could not build OpenSearch client while checking for an elected cluster manager", "error", err.Error())
+		return false
+	}
+
+	managers, err := osClient.GetClusterManagers(r.ctx)
+	if err != nil {
+		r.logger.V(1).Info("Could not read elected cluster managers; keeping bootstrap pod", "error", err.Error())
+		return false
+	}
+
+	for _, manager := range managers {
+		// `_cat/cluster_manager` reports elected as a string: "*" once this
+		// manager has won, "-" while it has not.
+		if manager.Elected == "*" {
+			return true
+		}
+	}
+
+	r.logger.V(1).Info("No cluster manager has won an election yet; keeping bootstrap pod", "managers", len(managers))
+	return false
+}
+
 func (r *ClusterReconciler) reconcileBootstrapPod(desiredPod *corev1.Pod) (*ctrl.Result, error) {
 	// Check if bootstrap pod exists
 	existingPod, err := r.client.GetPod(desiredPod.Name, desiredPod.Namespace)
@@ -650,16 +722,12 @@ func (r *ClusterReconciler) reconcileBootstrapPod(desiredPod *corev1.Pod) (*ctrl
 		return r.client.ReconcileResource(desiredPod, reconciler.StateCreated)
 	}
 
-	updatePod := desiredPod.DeepCopy()
-	if _, err := r.client.ReconcileResource(updatePod, reconciler.StatePresent); err != nil {
-		if isImmutablePodUpdateErr(err) {
-			r.logger.Info("Bootstrap pod update touched immutable fields, recreating pod", "pod", desiredPod.Name)
-			return r.recreateBootstrapPod(&existingPod, desiredPod)
-		}
-		r.logger.Error(err, "Failed to update bootstrap pod", "pod", desiredPod.Name)
-		return &ctrl.Result{}, err
-	}
-
+	// Pods are immutable after admission. A mutating admission controller may add
+	// fields that are absent from the desired bootstrap spec; reconciling those
+	// differences would delete the only seed node before cluster formation.
+	// Bootstrap configuration is intentionally create-once. Once initialized,
+	// the caller removes the Pod through the StateAbsent path above.
+	r.logger.V(1).Info("Bootstrap pod already exists; skipping immutable reconciliation", "pod", existingPod.Name)
 	return &ctrl.Result{}, nil
 }
 
