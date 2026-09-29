@@ -346,6 +346,45 @@ func (client *OsClusterClient) GetClusterHealth() (responses.ClusterHealthRespon
 	return health, err
 }
 
+// GetClusterManagers returns the rows of `_cat/cluster_manager?format=json`.
+//
+// This is the authoritative check for whether a cluster manager has actually
+// WON AN ELECTION, as opposed to merely being Ready. Pod readiness is not
+// sufficient: a lone cluster manager reports Ready long before it can elect
+// itself, because the initial voting configuration written by the bootstrap
+// pod still names the seed node that is about to be deleted.
+func (client *OsClusterClient) GetClusterManagers(ctx context.Context) ([]responses.CatClusterManagerResponse, error) {
+	managers := []responses.CatClusterManagerResponse{}
+	resp, err := doHTTPGet(ctx, client.client, generateCatClusterManagerPath())
+	if err != nil {
+		return managers, err
+	}
+	defer helpers.SafeClose(resp.Body)
+
+	if resp.IsError() {
+		return managers, ErrClusterManagersGetFailed(resp.String())
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&managers); err != nil {
+		return managers, err
+	}
+	return managers, nil
+}
+
+// generateCatClusterManagerPath generates a URI PATH for the elected
+// cluster-manager list.
+// URI PATH = '_cat/cluster_manager?format=json'
+func generateCatClusterManagerPath() strings.Builder {
+	var path strings.Builder
+	path.Grow(1 + len("_cat") + 1 + len("cluster_manager") + len("?format=json"))
+	path.WriteString("/")
+	path.WriteString("_cat")
+	path.WriteString("/")
+	path.WriteString("cluster_manager")
+	path.WriteString("?format=json")
+	return path
+}
+
 func (client *OsClusterClient) IndexExists(indexName string) (bool, error) {
 	req := opensearchapi.CatIndicesRequest{
 		Format: "json",
