@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-logr/logr"
 	opensearchv1 "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/api/opensearch.org/v1"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/opensearch-gateway/responses"
 	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/builders"
 	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/helpers"
 	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconciler"
@@ -673,14 +674,25 @@ func (r *ClusterReconciler) UpdateClusterStatus() error {
 	})
 }
 
-// hasElectedClusterManager reports whether a cluster manager has actually WON
-// an election, as opposed to merely being Ready.
+// hasElectedClusterManager reports whether a cluster manager OTHER THAN the
+// bootstrap seed has actually WON an election, as opposed to merely being Ready.
 //
-// Readiness is not sufficient and is what made this bug possible. The bootstrap
-// pod seeds the initial voting configuration under its own node id; a lone
-// cluster manager becomes Ready while still waiting to reach that seed, because
-// the node it was told to expect is the very pod we are deciding whether to
-// delete. Deleting on readiness therefore strands the cluster permanently.
+// Readiness is not sufficient and is what made the first version of this bug
+// possible. The bootstrap pod seeds the initial voting configuration under its
+// own node id; a lone cluster manager becomes Ready while still waiting to
+// reach that seed, because the node it was told to expect is the very pod we
+// are deciding whether to delete. Deleting on readiness therefore strands the
+// cluster permanently.
+//
+// The seed is ALSO not sufficient evidence, which is the second half of the
+// bug. The bootstrap pod carries node.role=m, so it appears in
+// `_cat/cluster_manager` like any other manager, and in a fresh cluster it
+// HOLDS the election until enough real managers form a quorum among themselves.
+// Checking only "is some manager elected" is therefore self-satisfying: the
+// seed votes for itself and the gate can never fire. Confirmed live on
+// staging-eks, where bootstrap-0 was still the elected cluster manager 3h13m
+// after the cluster went green, leaving 4 manager-eligible nodes and raising
+// quorum from 2-of-3 to 3-of-4 for a node nobody intended to keep.
 //
 // Any error is treated as "not elected" so the seed is kept. Failing closed here
 // costs a leftover pod; failing open strands a cluster that can never form.
@@ -697,15 +709,42 @@ func (r *ClusterReconciler) hasElectedClusterManager() bool {
 		return false
 	}
 
+	if hasElectedNonBootstrapManager(managers, r.bootstrapNodeName()) {
+		return true
+	}
+
+	r.logger.V(1).Info("No non-bootstrap cluster manager has won an election yet; keeping bootstrap pod", "managers", len(managers))
+	return false
+}
+
+// bootstrapNodeName is the node id the seed votes under, as reported by
+// `_cat/cluster_manager`.
+func (r *ClusterReconciler) bootstrapNodeName() string {
+	return builders.BootstrapPodName(r.instance)
+}
+
+// hasElectedNonBootstrapManager reports whether any manager OTHER THAN the
+// bootstrap seed has won a vote.
+//
+// Split out as a pure function so the election rule can be tested directly,
+// without an OpenSearch client or a cluster. The earlier regression only
+// asserted the shape of the source, so it passed while the gate was
+// unsatisfiable in exactly the case that mattered.
+func hasElectedNonBootstrapManager(managers []responses.CatClusterManagerResponse, bootstrapNode string) bool {
 	for _, manager := range managers {
 		// `_cat/cluster_manager` reports elected as a string: "*" once this
 		// manager has won, "-" while it has not.
-		if manager.Elected == "*" {
-			return true
+		if manager.Elected != "*" {
+			continue
 		}
+		// The seed electing itself is not evidence that a real manager formed.
+		// Match on both the node id and the host, because OpenSearch has
+		// reported the seed under either depending on version.
+		if manager.Node == bootstrapNode || manager.Name == bootstrapNode || manager.Host == bootstrapNode {
+			continue
+		}
+		return true
 	}
-
-	r.logger.V(1).Info("No cluster manager has won an election yet; keeping bootstrap pod", "managers", len(managers))
 	return false
 }
 
