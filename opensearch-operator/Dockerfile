@@ -22,7 +22,12 @@ ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o manager main.go
 
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi10-minimal:10.1
+# NOTE: the runtime stage must NOT pin --platform=$BUILDPLATFORM. That is
+# correct for the builder stage (it compiles the target arch from source) but
+# wrong here: pinning the runtime image to the build host would emit an
+# amd64-only runtime layer into an otherwise multi-arch build, so an arm64 node
+# would find no matching manifest ("no match for platform in manifest").
+FROM registry.access.redhat.com/ubi10-minimal:10.1
 
 LABEL name="opensearch-operator" \
       vendor="OpenSearch Project" \
