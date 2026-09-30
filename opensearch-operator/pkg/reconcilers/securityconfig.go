@@ -185,9 +185,22 @@ func (r *SecurityconfigReconciler) Reconcile() (ctrl.Result, error) {
 	job, err := r.client.GetJob(jobName, namespace)
 	if err == nil {
 		value, exists := job.Annotations[checksumAnnotation]
-		if exists && value == checksumval {
+		// A job carrying the current checksum counts as "already applied" only
+		// if it actually succeeded. The job runs with BackoffLimit 0 and
+		// RestartPolicy Never, so a single failed attempt -- typically the
+		// cluster-manager not being reachable yet while the cluster is still
+		// forming -- would otherwise leave it Failed forever: the checksum keeps
+		// matching, this branch keeps returning early, .opendistro_security is
+		// never created, the manager never becomes ready, OrderedReady blocks
+		// the next replica, and the cluster never forms. Recreate on failure so
+		// the next attempt can retry once the cluster is up.
+		if exists && value == checksumval && job.Status.Failed == 0 {
 			// Nothing to do, current securityconfig already applied
 			return ctrl.Result{}, nil
+		}
+		if job.Status.Failed > 0 {
+			r.logger.Info("Security config update job failed, recreating it")
+			r.recorder.AnnotatedEventf(r.instance, annotations, "Warning", "Security", "Security config update job failed and will be recreated")
 		}
 		// Delete old job
 		r.logger.Info("Deleting old update job")

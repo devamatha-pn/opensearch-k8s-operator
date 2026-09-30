@@ -366,4 +366,112 @@ done;`
 			Expect(createdJob.Spec.Template.Spec.Containers[0].Args[0]).To(Equal(cmdArg))
 		})
 	})
+
+	When("When the existing securityconfig-update job has already failed", func() {
+		It("should delete and recreate it instead of treating the matching checksum as applied", func() {
+			mockClient := k8s.NewMockK8sClient(GinkgoT())
+			var clusterName = "securityconfig-failed-job"
+			jobName := clusterName + "-securityconfig-update"
+
+			spec := opensearchv1.OpenSearchCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: clusterName, UID: "dummyuid"},
+				Spec: opensearchv1.ClusterSpec{
+					General: opensearchv1.GeneralConfig{
+						ServiceName: clusterName,
+						Version:     "2.3",
+					},
+					Security: &opensearchv1.Security{
+						Config: &opensearchv1.SecurityConfig{},
+						Tls: &opensearchv1.TlsConfig{
+							Transport: &opensearchv1.TlsConfigTransport{Generate: true},
+							Http:      &opensearchv1.TlsConfigHttp{Generate: true},
+						},
+					},
+				},
+			}
+			generatedAdminName := helpers.GeneratedAdminCredentialsSecretName(&spec)
+			generatedConfigName := helpers.GeneratedSecurityConfigSecretName(&spec)
+			autoAdminSecret := corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      generatedAdminName,
+					Namespace: clusterName,
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("auto-generated"),
+				},
+			}
+
+			mockClient.On("GetSecret", generatedAdminName, clusterName).Return(corev1.Secret{}, NotFoundError()).Once()
+			mockClient.On("CreateSecret", mock.MatchedBy(func(secret *corev1.Secret) bool {
+				return secret.Name == generatedAdminName
+			})).Return(&ctrl.Result{}, nil)
+			mockClient.On("GetSecret", generatedAdminName, clusterName).Return(autoAdminSecret, nil).Once()
+			setupDashboardsCredentialsSecretMocks(mockClient, clusterName)
+			mockClient.On("GetSecret", generatedConfigName, clusterName).Return(corev1.Secret{}, NotFoundError()).Once()
+			mockClient.EXPECT().Scheme().Return(scheme.Scheme)
+			mockClient.On("UpdateOpenSearchClusterStatus", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+			var generatedConfigSecret *corev1.Secret
+			mockClient.On("ReconcileResource", mock.AnythingOfType("*v1.Secret"), mock.Anything).
+				Return(&ctrl.Result{}, nil).
+				Run(func(args mock.Arguments) {
+					if secret, ok := args[0].(*corev1.Secret); ok && secret.Name == generatedConfigName {
+						generatedConfigSecret = secret.DeepCopy()
+					}
+				})
+			mockClient.On("GetSecret", generatedConfigName, clusterName).
+				Return(func(string, string) corev1.Secret {
+					Expect(generatedConfigSecret).ToNot(BeNil())
+					return *generatedConfigSecret
+				}, nil)
+
+			// The job from the previous attempt FAILED, but its checksum annotation
+			// matches the config that is current right now. Before the fix the
+			// reconciler returned early on the checksum alone, so a job built with
+			// BackoffLimit 0 and RestartPolicy Never was never retried: the security
+			// index was never seeded, the manager never became ready, OrderedReady
+			// blocked the next replica, and the cluster never formed.
+			var deletedJob *batchv1.Job
+			mockClient.On("GetJob", jobName, clusterName).
+				Return(func(string, string) batchv1.Job {
+					sum, checksumErr := checksum(generatedConfigSecret.Data)
+					Expect(checksumErr).ToNot(HaveOccurred())
+					return batchv1.Job{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:        jobName,
+							Namespace:   clusterName,
+							Annotations: map[string]string{checksumAnnotation: sum},
+						},
+						Status: batchv1.JobStatus{Failed: 1},
+					}
+				}, nil).Once()
+			mockClient.On("DeleteJob", mock.Anything).
+				Return(func(job *batchv1.Job) error {
+					deletedJob = job
+					return nil
+				})
+
+			var createdJob *batchv1.Job
+			mockClient.On("CreateJob", mock.Anything).
+				Return(func(job *batchv1.Job) (*ctrl.Result, error) {
+					createdJob = job
+					return &ctrl.Result{}, nil
+				})
+
+			reconcilerContext := NewReconcilerContext(&record.FakeRecorder{}, &spec, spec.Spec.NodePools)
+			underTest := newSecurityconfigReconciler(
+				mockClient,
+				context.Background(),
+				&reconcilerContext,
+				&spec,
+			)
+			_, err := underTest.Reconcile()
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(deletedJob).ToNot(BeNil())
+			Expect(createdJob).ToNot(BeNil())
+			Expect(createdJob.Name).To(Equal(jobName))
+		})
+	})
 })
