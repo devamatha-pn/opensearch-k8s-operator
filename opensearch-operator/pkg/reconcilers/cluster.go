@@ -222,9 +222,21 @@ func (r *ClusterReconciler) Reconcile() (ctrl.Result, error) {
 		// Keeping the seed until a cluster manager has actually WON an election
 		// lets the single-manager case form too, because the manager can still
 		// reach the node it was configured to vote with.
-		if r.hasElectedClusterManager() {
+		if allClusterManagerPoolsScaledToZero(r.instance) {
+			// A formed cluster whose cluster-manager pools are all at 0 replicas is
+			// asleep (scheduled sleep scales the pools to 0). No manager can be
+			// elected, so the gate below would keep, and even re-create, the seed
+			// all night, and its node would never be reclaimed. The seed only
+			// matters for forming a cluster; this one already formed. On wake the
+			// pools scale back up and the normal path below applies again.
+			r.logger.V(1).Info(
+				"Cluster-manager pools are scaled to zero; not keeping bootstrap pod",
+				"namespace", r.instance.Namespace, "cluster", r.instance.Name,
+			)
+			result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
+		} else if r.hasElectedClusterManager() {
 			// Exclude bootstrap from voting before deletion so small master pools do not lose quorum.
-				result.Combine(r.removeBootstrapPod(bootstrapPod))
+			result.Combine(r.removeBootstrapPod(bootstrapPod))
 		} else {
 			r.logger.Info(
 				"Keeping bootstrap pod until a cluster manager is elected",
@@ -898,6 +910,24 @@ func (r *ClusterReconciler) hasElectedClusterManager() bool {
 
 	r.logger.V(1).Info("No non-bootstrap cluster manager has won an election yet; keeping bootstrap pod", "managers", len(managers))
 	return false
+}
+
+// allClusterManagerPoolsScaledToZero reports whether the cluster has at least
+// one cluster-manager node pool and every one of them asks for 0 replicas.
+// A cluster with no manager pool is never treated as asleep.
+func allClusterManagerPoolsScaledToZero(cr *opensearchv1.OpenSearchCluster) bool {
+	managerRole := helpers.ResolveClusterManagerRole(cr.Spec.General.Version)
+	found := false
+	for _, nodePool := range cr.Spec.NodePools {
+		if !helpers.ContainsString(helpers.MapClusterRoles(nodePool.Roles, cr.Spec.General.Version), managerRole) {
+			continue
+		}
+		found = true
+		if nodePool.Replicas != 0 {
+			return false
+		}
+	}
+	return found
 }
 
 // bootstrapNodeName is the node id the seed votes under, as reported by
