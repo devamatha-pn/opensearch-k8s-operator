@@ -158,6 +158,17 @@ func (r *ClusterReconciler) Reconcile() (ctrl.Result, error) {
 			result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
 		} else if r.hasElectedClusterManager() {
 			result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
+		} else if r.seedNoLongerNeeded() {
+			// With 3 or more cluster managers, all of them Ready, the managers can
+			// elect among themselves (2 of 3 is a majority), so the seed has no job
+			// left. Do not wait for the election query: on bellxco-dev 2026-11-12 it
+			// kept answering "not elected" while the real managers had already
+			// elected, and the seed stayed up all day.
+			r.logger.Info(
+				"All cluster managers are Ready; removing bootstrap pod",
+				"namespace", r.instance.Namespace, "cluster", r.instance.Name,
+			)
+			result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
 		} else {
 			// Any error other than NotFound counts as "exists", so the seed is kept.
 			_, getErr := r.client.GetPod(bootstrapPod.Name, bootstrapPod.Namespace)
@@ -742,6 +753,39 @@ func (r *ClusterReconciler) hasElectedClusterManager() bool {
 
 	r.logger.V(1).Info("No non-bootstrap cluster manager has won an election yet; keeping bootstrap pod", "managers", len(managers))
 	return false
+}
+
+// seedIsRedundant reports whether the bootstrap pod can be removed without
+// waiting for an election: the cluster formed, it has enough cluster managers to
+// elect without the seed, and every cluster-manager StatefulSet has all of its
+// replicas Ready. With fewer than minManagersToElectWithoutSeed managers the seed
+// holds the initial voting configuration, so it must stay until a real election.
+func seedIsRedundant(initialized bool, managerReplicas int32, managerPoolsReady bool) bool {
+	return initialized && managerReplicas >= minManagersToElectWithoutSeed && managerPoolsReady
+}
+
+// seedNoLongerNeeded reads the cluster-manager StatefulSets (a call the operator
+// already makes, so no new RBAC) and applies seedIsRedundant.
+func (r *ClusterReconciler) seedNoLongerNeeded() bool {
+	managerReplicas := clusterManagerReplicas(r.instance)
+	if !seedIsRedundant(r.instance.Status.Initialized, managerReplicas, true) {
+		return false
+	}
+	managerRole := helpers.ResolveClusterManagerRole(r.instance.Spec.General.Version)
+	for i := range r.instance.Spec.NodePools {
+		nodePool := &r.instance.Spec.NodePools[i]
+		if !helpers.ContainsString(helpers.MapClusterRoles(nodePool.Roles, r.instance.Spec.General.Version), managerRole) {
+			continue
+		}
+		sts, err := r.client.GetStatefulSet(builders.StsName(r.instance, nodePool), r.instance.Namespace)
+		if err != nil {
+			return false
+		}
+		if sts.Status.ReadyReplicas < nodePool.Replicas || nodePool.Replicas == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // clusterManagerReplicas is the total number of replicas across all

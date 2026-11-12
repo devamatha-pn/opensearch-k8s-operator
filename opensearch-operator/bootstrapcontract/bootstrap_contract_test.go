@@ -100,6 +100,11 @@ func TestBootstrapPodIsOnlyDeletedOnceAClusterManagerIsElected(t *testing.T) {
 	if !strings.Contains(gate, "reconcileBootstrapPod(bootstrapPod)") {
 		t.Fatal("the seed must be retained while no cluster manager is elected")
 	}
+	// Once the formed cluster has 3+ managers all Ready the seed is removed without
+	// waiting for the election query, which can answer "not elected" indefinitely.
+	if !strings.Contains(gate, "seedNoLongerNeeded()") {
+		t.Fatal("the seed must be removed once a formed cluster has 3+ cluster managers all Ready")
+	}
 	// A formed cluster that wakes from sleep must not get a NEW seed: it would form
 	// its own cluster uuid, which the real managers reject.
 	if !strings.Contains(gate, "shouldMaintainBootstrapPod(") {
