@@ -100,6 +100,11 @@ func TestBootstrapPodIsOnlyDeletedOnceAClusterManagerIsElected(t *testing.T) {
 	if !strings.Contains(gate, "reconcileBootstrapPod(bootstrapPod)") {
 		t.Fatal("the seed must be retained while no cluster manager is elected")
 	}
+	// A formed cluster that wakes from sleep must not get a NEW seed: it would form
+	// its own cluster uuid, which the real managers reject.
+	if !strings.Contains(gate, "shouldMaintainBootstrapPod(") {
+		t.Fatal("a missing seed must not be re-created on an already formed cluster with enough managers")
+	}
 	// An election completes inside OpenSearch with no Kubernetes event to
 	// trigger a watch, so the gate must poll rather than wait.
 	if !strings.Contains(gate, "RequeueAfter: bootstrapElectionRequeueInterval") {
@@ -117,7 +122,12 @@ func TestBootstrapPodIsOnlyDeletedOnceAClusterManagerIsElected(t *testing.T) {
 	}
 	election := source[electionStart : electionStart+electionEnd]
 
-	if !strings.Contains(election, `manager.Elected == "*"`) {
+	ruleStart := strings.Index(source, "func hasElectedNonBootstrapManager(")
+	if ruleStart == -1 {
+		t.Fatal("hasElectedNonBootstrapManager not found")
+	}
+	rule := source[ruleStart:]
+	if !strings.Contains(election, "hasElectedNonBootstrapManager(managers") || !strings.Contains(rule, `manager.Elected != "*"`) {
 		t.Fatal("an election must be read from the elected field, not inferred from readiness")
 	}
 	if strings.Count(election, "return false") < 2 {

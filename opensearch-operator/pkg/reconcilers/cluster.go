@@ -159,11 +159,26 @@ func (r *ClusterReconciler) Reconcile() (ctrl.Result, error) {
 		} else if r.hasElectedClusterManager() {
 			result.Combine(r.client.ReconcileResource(bootstrapPod, reconciler.StateAbsent))
 		} else {
-			r.logger.Info(
-				"Keeping bootstrap pod until a cluster manager is elected",
-				"namespace", r.instance.Namespace, "cluster", r.instance.Name,
-			)
-			result.Combine(r.reconcileBootstrapPod(bootstrapPod))
+			// Any error other than NotFound counts as "exists", so the seed is kept.
+			_, getErr := r.client.GetPod(bootstrapPod.Name, bootstrapPod.Namespace)
+			seedExists := getErr == nil || !k8serrors.IsNotFound(getErr)
+			if shouldMaintainBootstrapPod(seedExists, clusterManagerReplicas(r.instance)) {
+				r.logger.Info(
+					"Keeping bootstrap pod until a cluster manager is elected",
+					"namespace", r.instance.Namespace, "cluster", r.instance.Name,
+				)
+				result.Combine(r.reconcileBootstrapPod(bootstrapPod))
+			} else {
+				// The cluster already formed and the seed is gone (it was removed
+				// while the cluster slept). Creating a new seed now makes it form
+				// a second cluster with its own cluster UUID, which the real
+				// managers refuse to join, and the election gate then never
+				// passes. The managers can elect among themselves, so wait.
+				r.logger.Info(
+					"Not re-creating bootstrap pod for an already formed cluster; waiting for the cluster managers to elect",
+					"namespace", r.instance.Namespace, "cluster", r.instance.Name,
+				)
+			}
 			// Re-check: an election can complete with no Kubernetes event to
 			// trigger us, so poll rather than wait for a watch notification.
 			result.Combine(&ctrl.Result{RequeueAfter: bootstrapElectionRequeueInterval}, nil)
@@ -727,6 +742,36 @@ func (r *ClusterReconciler) hasElectedClusterManager() bool {
 
 	r.logger.V(1).Info("No non-bootstrap cluster manager has won an election yet; keeping bootstrap pod", "managers", len(managers))
 	return false
+}
+
+// clusterManagerReplicas is the total number of replicas across all
+// cluster-manager node pools.
+func clusterManagerReplicas(cr *opensearchv1.OpenSearchCluster) int32 {
+	managerRole := helpers.ResolveClusterManagerRole(cr.Spec.General.Version)
+	var total int32
+	for _, nodePool := range cr.Spec.NodePools {
+		if helpers.ContainsString(helpers.MapClusterRoles(nodePool.Roles, cr.Spec.General.Version), managerRole) {
+			total += nodePool.Replicas
+		}
+	}
+	return total
+}
+
+// minManagersToElectWithoutSeed is the smallest manager count that can elect
+// without the seed: with 3 managers, 2 of 3 is a majority.
+const minManagersToElectWithoutSeed = 3
+
+// shouldMaintainBootstrapPod decides, for an initialized cluster with no manager
+// elected yet, whether the operator keeps or creates the seed pod. An existing
+// seed is always kept. A missing seed is only created when the cluster is too
+// small to elect without it: a formed cluster with enough managers must not get
+// a new seed, because that seed forms its own cluster (different cluster UUID)
+// that the real managers reject.
+func shouldMaintainBootstrapPod(seedExists bool, managerReplicas int32) bool {
+	if seedExists {
+		return true
+	}
+	return managerReplicas < minManagersToElectWithoutSeed
 }
 
 // allClusterManagerPoolsScaledToZero reports whether the cluster has at least
